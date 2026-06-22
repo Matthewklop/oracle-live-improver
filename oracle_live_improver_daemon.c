@@ -35,6 +35,8 @@
 #include <sys/uio.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
 #include <sched.h>
 #include <errno.h>
 #include <time.h>
@@ -202,13 +204,14 @@ static int apply_nop_patches(pid_t pid, int mem_fd) {
         if (sz > 8UL * 1048576UL) sz = 8UL * 1048576UL;
         if (sz < 16) continue;
         
-        // Read memory
+        // Read memory — try process_vm_readv, fallback to /proc/mem
         struct iovec lo = {buf, sz};
         struct iovec ro = {(void*)(uintptr_t)s, sz};
-        if (process_vm_readv(pid, &lo, 1, &ro, 1, 0) < 0) {
-            if (mem_fd >= 0) {
-                if (pread64(mem_fd, buf, sz, s) != (ssize_t)sz) continue;
-            } else continue;
+        int can_read = (process_vm_readv(pid, &lo, 1, &ro, 1, 0) > 0);
+        if (!can_read) {
+            if (mem_fd >= 0)
+                can_read = (pread64(mem_fd, buf, sz, s) == (ssize_t)sz);
+            if (!can_read) continue;
         }
         
         // Scan for NOP runs
@@ -217,15 +220,39 @@ static int apply_nop_patches(pid_t pid, int mem_fd) {
             int run = 0;
             while (off + run < sz && buf[off+run] == 0x90 && run < 8) run++;
             if (run >= 2 && run <= 8 && nops[run][0]) {
-                // Write optimized NOP
+                // Write optimized NOP — try ptrace attach first for permissions
+                int did_write = 0;
+                
+                // Try process_vm_writev
                 struct iovec lw = {(void*)nops[run], run};
                 struct iovec rw = {(void*)(uintptr_t)(s + off), run};
                 if (process_vm_writev(pid, &lw, 1, &rw, 1, 0) > 0) {
-                    patches++;
+                    did_write = 1;
                 } else if (mem_fd >= 0) {
                     if (pwrite64(mem_fd, nops[run], run, s + off) == (ssize_t)run)
-                        patches++;
+                        did_write = 1;
                 }
+                
+                // Fallback: ptrace POKETEXT
+                if (!did_write) {
+                    int pt_attached = 0;
+                    if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == 0) {
+                        waitpid(pid, NULL, WNOHANG);
+                        pt_attached = 1;
+                    }
+                    if (pt_attached || errno == ESRCH) { // ESRCH = already traced
+                        for (int b = 0; b < run; b += 8) {
+                            int chunk = (run - b > 8) ? 8 : (run - b);
+                            unsigned long val = 0;
+                            memcpy(&val, nops[run] + b, chunk);
+                            ptrace(PTRACE_POKETEXT, pid, (void*)(uintptr_t)(s + off + b), (void*)val);
+                        }
+                        if (pt_attached) ptrace(PTRACE_DETACH, pid, NULL, NULL);
+                        did_write = 1;
+                    }
+                }
+                
+                if (did_write) patches++;
                 off += run;
             }
         }
@@ -310,23 +337,40 @@ static void watch_process(WatchedProc *wp) {
     
     float ipc = cycles > 0 ? (float)instrs / cycles : 0;
     float bmr = branches > 0 ? (float)bmiss / branches * 100 : 0;
+    
+    // Skip patching on first run — need a baseline
+    if (wp->nop_patches == 0 && cycles == 0) {
+        wp->last_ipc = ipc;
+        wp->last_bmr = bmr;
+        return; // wait for next cycle to have delta
+    }
+    
     wp->last_ipc = ipc;
     wp->last_bmr = bmr;
     
-    // Decide if we need to act
-    int needs_nop = (ipc < 0.8 && wp->nop_patches < 100);
-    int needs_tune = (wp->is_jvm && dt > 0.5); // > 500ms CPU in interval = loaded
+    // Decide if we need to act — only after we have a baseline
+    int needs_nop = 0;
+    int needs_tune = (wp->is_jvm && dt > 0.5);
+    if (wp->last_ipc > 0.01) {
+        needs_nop = (wp->last_ipc < 1.5 && wp->nop_patches < 100);
+    }
     
-    if (needs_nop) {
+    if (needs_nop && wp->nop_patches < 3) { // limit to 3 rounds
         printf("[daemon] PID %d (%s) IPC=%.2f BrMiss=%.2f%% — applying NOP patches\n",
                wp->pid, wp->name, ipc, bmr);
+        fflush(stdout);
         int p = apply_nop_patches(wp->pid, wp->mem_fd);
         if (p > 0) {
             wp->nop_patches += p;
             wp->patches_applied += p;
             state.total_patches += p;
-            printf("[daemon]   → %d NOP consolidations applied (total: %d)\n",
+            printf("[daemon]   ✓ %d NOP consolidations applied (total: %d)\n",
                    p, wp->nop_patches);
+            fflush(stdout);
+        } else {
+            printf("[daemon]   ✗ No patches applied (mem_fd=%d, errno=%d)\n",
+                   wp->mem_fd, errno);
+            fflush(stdout);
         }
     }
     
@@ -421,6 +465,7 @@ static void scan_processes(void) {
             
             printf("[daemon] 👀 Watching PID %d (%s) JVM=%d\n",
                    pid, wp->name, wp->is_jvm);
+            fflush(stdout);
         }
     }
     closedir(d);
@@ -432,6 +477,7 @@ int main(void) {
     printf("║   ORACLE LIVE IMPROVER DAEMON                      ║\n");
     printf("║   Autonomous watchdog + NOP optimizer + JVM tuner  ║\n");
     printf("╚══════════════════════════════════════════════════════╝\n\n");
+    fflush(stdout);
     
     state.running = 1;
     state.daemon_cycles = 0;
@@ -469,8 +515,8 @@ int main(void) {
             }
         }
         
-        // Print status every 10 cycles
-        if (state.daemon_cycles % 10 == 0) {
+        // Print status every cycle
+        if (state.daemon_cycles % 1 == 0) {
             int alive = 0, patched = 0;
             for (int i = 0; i < state.nprocs; i++) {
                 if (state.procs[i].pid > 0) alive++;
@@ -478,6 +524,7 @@ int main(void) {
             }
             printf("[daemon] 📊 Cycle %lu — watching %d procs, %d patched, %lu total patches\n",
                    state.daemon_cycles, alive, patched, state.total_patches);
+            fflush(stdout);
         }
         
         sleep(SCAN_INTERVAL);
