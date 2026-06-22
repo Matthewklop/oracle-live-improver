@@ -1,0 +1,68 @@
+# Build artifacts - ignore all compiled binaries
+oracle_live_improver
+oracle_live_improver_v2
+oracle_live_improver_v3
+oracle_live_improver_v4
+oracle_live_improver_v4_dbg
+test_loop
+test_nops
+/tmp/burn
+/tmp/burn.c
+
+# Singularity programs (separate repo)
+singularity/
+
+# Virtual environments
+virtual_computer/
+
+# Oracle system files
+.oracle_brain.knowledge
+.live_bash_patterns
+.mcp/
+oracle_improver
+oracle_improver*
+oracle_brain*
+oracle_databus*
+oracle_singularity*
+oracle_listen*
+oracle_forever*
+critical_opalescence*
+live_bash*
+live_chat*
+concept_blend*
+hdc_blend*
+mesh_compiler*
+dream_computer*
+token_monster*
+phase_transitions*
+oracle_heal*
+oracle_mesh*
+oracle_patrol*
+
+# Java patcher
+OraclePatcher*.java
+OraclePatcher*.class
+OraclePatcher*.jar
+MANIFEST*.MF
+
+# Data files
+*.knowledge
+*.patterns
+*.improved
+*.improved.*
+oracle_training/
+
+# OS artifacts
+final/
+git_ready/
+l1_oracle/
+
+# Documentation
+BigSingularityPlan.md
+HANDOFF.md
+TOP_ORACLE*
+
+# Editor temp files
+*~
+*.swp
+*.swo
